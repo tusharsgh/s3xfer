@@ -155,19 +155,21 @@ Prefer short-lived credentials: an IAM role on EC2/ECS/Lambda, SSO, or `aws logi
 
 ## Real-S3 benchmarks
 
-Measured on an `m7i-flex.large` in `ap-southeast-2`, copying within one bucket; median of 3 runs. Reproduce with `bench/bench_real_s3.py` (see its docstring) and `bench/plot_real_s3.py`. Raw numbers: [`bench/real_s3_results.csv`](bench/real_s3_results.csv).
+Measured on an `m7i-flex.large` in `ap-southeast-2` with Python 3.11, copying within one bucket; median of 3 runs. Reproduce with `bench/bench_real_s3.py` (see its docstring) and `bench/plot_real_s3.py`. Raw numbers: [`bench/real_s3_results.csv`](bench/real_s3_results.csv).
 
-**Memory doesn't depend on file size.** 1, 4 and 16 GiB objects at `--memory 256MiB --concurrency 16` peak at 324, 325 and 330 MiB (the budget plus ~60 MiB fixed for Python, boto3 and the CRT).
+**Memory is bounded by the budget, not by file size.** 1, 4 and 16 GiB objects at `--memory 256MiB --concurrency 16` peaked at 265, 277 and 310 MiB: 16× the data, all within the budget plus ~60 MiB fixed for Python, boto3 and the CRT. (An earlier run on Python 3.9 measured 324, 325 and 330 MiB.)
 
 ![Peak memory and throughput vs file size](bench/real_s3_file_size.png)
 
-**Concurrency is bounded by the budget.** Up to 8 streams, 16 MiB chunks fit, so memory grows with each stream. Past that, chunks shrink to keep memory at the budget. Throughput peaks at 16 streams (8 MiB chunks, 378 MiB/s); at 32+ the planner hits S3's 5 MiB part minimum and caps at 25 streams, which is slower.
+**Concurrency is bounded by the budget.** Up to 8 streams, 16 MiB chunks fit, so memory grows with each stream. Past that, chunks shrink to keep memory at the budget (267–272 MiB from 16 to 64 streams). Throughput rose almost linearly to 8 streams (45 → 298 MiB/s), then stayed at 250–300 MiB/s.
 
 ![Throughput and peak memory vs concurrency at a 256 MiB budget](bench/real_s3_concurrency.png)
 
-**Chunk size trades a little speed for a lot of memory.** At 16 streams, 8 MiB chunks are 8% slower than 16 MiB and use 44% less memory; 5 MiB chunks cost 25%.
+**Chunk size mostly changes memory.** At 16 streams, 5, 8 and 16 MiB chunks peaked at 202, 288 and 378 MiB, with throughput within 13% of each other.
 
 ![Throughput and peak memory by chunk size at 16 streams](bench/real_s3_chunk_size.png)
+
+**Throughput ceilings vary by host.** Single-stream and low-concurrency results matched between runs (22.6 s for 1 GiB on one stream both times), but this run topped out near 300 MiB/s, while the earlier Python 3.9 run on the same instance type reached ~430 MiB/s and showed 5 MiB chunks 25% slower than 16 MiB. With the ceiling lower, chunk size made little difference. Benchmark on your own instance type before tuning concurrency beyond 8.
 
 ## Development
 

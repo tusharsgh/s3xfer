@@ -115,11 +115,10 @@ def chunk_chart(med, meta):
     d = sorted(med("chunk"), key=lambda r: r["chunk"])
     names = [f"{r['chunk']} MiB\n({r['memory']})" for r in d]
     fig, (a, b) = plt.subplots(1, 2, figsize=(11, 4.6), dpi=144)
-    by = {r["chunk"]: r for r in d}
-    slower = 1 - by[8]["mibs"] / by[16]["mibs"]
-    leaner = 1 - by[8]["rss"] / by[16]["rss"]
-    fig.suptitle(f"Same {d[0]['streams']} streams, different chunk sizes: 8 MiB chunks are "
-                 f"{slower:.0%} slower than 16 MiB and use {leaner:.0%} less memory",
+    speeds = [r["mibs"] for r in d]
+    spread = 1 - min(speeds) / max(speeds)
+    fig.suptitle(f"Same {d[0]['streams']} streams, different chunk sizes: memory scales with chunk size "
+                 f"({d[0]['rss']:.0f} → {d[-1]['rss']:.0f} MiB), throughput within {spread:.0%}",
                  x=0.01, ha="left", fontweight="bold", color=INK, fontsize=12)
     bars(a, names, [r["mibs"] for r in d], lambda v: f"{v:.0f}")
     a.set_title("Throughput (MiB/s)")
@@ -138,7 +137,9 @@ def filesize_chart(med, meta):
     xs = list(range(len(d)))
     gib = [f"{r['file_mib'] / 1024:g} GiB" for r in d]
     fig, (a, b) = plt.subplots(1, 2, figsize=(11, 4.6), dpi=144)
-    fig.suptitle("Bigger files, same memory: peak memory doesn't depend on file size",
+    first, last = d[0], d[-1]
+    fig.suptitle(f"{last['file_mib'] // first['file_mib']}× the data, peak memory {first['rss']:.0f} → "
+                 f"{last['rss']:.0f} MiB: bounded by the budget + fixed overhead, not by file size",
                  x=0.01, ha="left", fontweight="bold", color=INK, fontsize=12)
     line(a, xs, [r["rss"] for r in d], [f"{r['rss']:.0f}" for r in d])
     budget_line(a, 256)

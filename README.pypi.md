@@ -49,7 +49,7 @@ peak memory ≈ concurrency × chunk_size × 2  ≤  budget   (+ ~60 MiB fixed f
 
 Chunks only go above 16 MiB when S3's 10,000-part limit forces it (files over ~156 GiB), or when you raise the ceiling with `--max-chunk` / `max_chunk=`, which prints a warning.
 
-Measured on real S3 (EC2 `m7i-flex.large`, `--memory 256MiB --concurrency 16`): 1, 4 and 16 GiB objects peaked at 324, 325 and 330 MiB, at 370–430 MiB/s.
+Measured on real S3 (EC2 `m7i-flex.large`, Python 3.11, `--memory 256MiB --concurrency 16`): 1, 4 and 16 GiB objects peaked at 265, 277 and 310 MiB, within the budget plus fixed overhead, at 265–280 MiB/s.
 
 ## Credentials and access
 
