@@ -90,19 +90,21 @@ A prefix is treated as a folder: `s3://b/data` matches `data/...` but not `data2
 
 Without `--dst-profile`, the destination uses the same credentials as the source. Without `--src-profile`, the source uses boto3's default credential chain.
 
-### Measured on EC2 (m7i-flex.large, ap-southeast-2, 1 GiB object, median of 3)
+## Real-S3 benchmarks
 
-| `--memory` | `--concurrency` | chunk × streams | time | peak RSS |
-| --- | --- | --- | --- | --- |
-| 256MiB | 1 | 16 MiB × 1 | 22.3s | 87 MiB |
-| 256MiB | 4 | 16 MiB × 4 | 5.9s | 185 MiB |
-| 256MiB | 8 | 16 MiB × 8 | 3.2s | 316 MiB |
-| 256MiB | 16 | 8 MiB × 16 | **2.8s** | 323 MiB |
-| 256MiB | 32 | 5 MiB × 25 | 3.4s | 263 MiB |
-| 512MiB | 16 | 16 MiB × 16 | 2.6s | 579 MiB |
-| 160MiB | 16 | 5 MiB × 16 | 3.5s | 211 MiB |
+Measured on an `m7i-flex.large` in `ap-southeast-2`, copying within one bucket; median of 3 runs. Reproduce with `bench/bench_real_s3.py` (see its docstring) and `bench/plot_real_s3.py`. Raw numbers: [`bench/real_s3_results.csv`](bench/real_s3_results.csv).
 
-At a fixed budget, memory stays flat as concurrency rises. 8 MiB chunks cost ~8% speed versus 16 MiB; 5 MiB chunks cost ~30%, enough that 25 × 5 MiB is slower than 8 × 16 MiB.
+**Memory doesn't depend on file size.** 1, 4 and 16 GiB objects at `--memory 256MiB --concurrency 16` peak at 324, 325 and 330 MiB (the budget plus ~60 MiB fixed for Python, boto3 and the CRT).
+
+![Peak memory and throughput vs file size](bench/real_s3_file_size.png)
+
+**Concurrency is bounded by the budget.** Up to 8 streams, 16 MiB chunks fit, so memory grows with each stream. Past that, chunks shrink to keep memory at the budget. Throughput peaks at 16 streams (8 MiB chunks, 378 MiB/s); at 32+ the planner hits S3's 5 MiB part minimum and caps at 25 streams, which is slower.
+
+![Throughput and peak memory vs concurrency at a 256 MiB budget](bench/real_s3_concurrency.png)
+
+**Chunk size trades a little speed for a lot of memory.** At 16 streams, 8 MiB chunks are 8% slower than 16 MiB and use 44% less memory; 5 MiB chunks cost 25%.
+
+![Throughput and peak memory by chunk size at 16 streams](bench/real_s3_chunk_size.png)
 
 ## Development
 
@@ -112,12 +114,15 @@ pytest                          # 58 tests against moto (fake S3, no AWS account
 pip install -e ".[bench]"
 python bench/bench_memory.py    # memory benchmark → bench/results.csv
 python bench/plot.py            # redraw bench/memory_vs_filesize.png
+python bench/bench_real_s3.py --bucket <bucket> --region <region>   # real S3 (run on EC2 near the bucket)
+python bench/plot_real_s3.py    # redraw the bench/real_s3_*.png charts
 ```
 
 ## Roadmap
 
 - [ ] Async backend (aioboto3)
-- [ ] Real-S3 benchmarks: throughput vs concurrency, cost per GB
+- [x] Real-S3 benchmarks: throughput and memory vs concurrency, chunk size and file size
+- [ ] Cost per GB (request + transfer pricing)
 - [ ] Resume interrupted copies from completed parts
 - [ ] Server-side `UploadPartCopy` fast path when one set of credentials can read both buckets
 
