@@ -1,6 +1,6 @@
 # s3xfer
 
-Stream and copy S3 objects of **any size in constant memory**.
+Stream and copy S3 objects of **any size in constant memory**. Requires Python 3.10+.
 
 A naive S3 copy reads the whole object into memory, so a 10 GB file needs 10+ GB of RAM and a worker with a fixed memory limit gets OOM-killed. `s3xfer` keeps memory flat: you give it a budget, and file size only changes how many chunks it moves, never how much it holds at once.
 
@@ -170,6 +170,8 @@ Measured on an `m7i-flex.large` in `ap-southeast-2`, copying within one bucket; 
 ![Throughput and peak memory by chunk size at 16 streams](bench/real_s3_chunk_size.png)
 
 ## Development
+
+Requires Python 3.10 or newer (boto3 dropped 3.9 in April 2026). On Amazon Linux 2023, whose default `python3` is 3.9, install one first: `sudo dnf install -y python3.11` and use `python3.11 -m venv .venv`.
 
 ```bash
 pip install -e ".[dev]"

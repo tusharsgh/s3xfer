@@ -1,0 +1,108 @@
+# Publish s3xfer with PyPI trusted publishing (no API tokens anywhere).
+#
+#   git tag v0.1.0 && git push origin v0.1.0         -> test, build, publish to TestPyPI
+#   gh workflow run publish.yml --ref v0.1.0 -f index=pypi   -> publish that tag to PyPI
+#
+# One-time setup: add a "pending publisher" on test.pypi.org and pypi.org for
+# owner tusharsgh, repo s3xfer, workflow publish.yml, environment testpypi / pypi.
+#
+# Actions are pinned to full commit SHAs so a moved tag can't change what runs.
+
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      index:
+        description: "Where to publish the checked-out tag"
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+
+permissions: {}  # nothing by default; each job asks for only what it needs
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        python: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d  # v10.4.0
+      - name: Run tests
+        env:
+          PY: ${{ matrix.python }}
+        run: |
+          uv venv --python "$PY"
+          uv pip install -e ".[dev]"
+          .venv/bin/python -m pytest -q
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d  # v10.4.0
+      - name: Tag must match package version
+        if: github.ref_type == 'tag'
+        run: |
+          version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/s3xfer/__init__.py)
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match __version__ $version"; exit 1
+          fi
+      - run: uv build
+      - run: uvx twine check --strict dist/*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish-testpypi:
+    needs: build
+    if: github.event_name == 'push' || inputs.index == 'testpypi'
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/s3xfer
+    permissions:
+      id-token: write  # short-lived OIDC token, exchanged with TestPyPI for a 15-minute upload token
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # Attestations would record this private repo's name in Sigstore's public log.
+          attestations: false
+
+  publish-pypi:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.index == 'pypi' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/s3xfer
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
+        with:
+          attestations: false
