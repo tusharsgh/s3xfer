@@ -361,3 +361,158 @@ def test_cli_without_dst_profile_uses_one_client(s3, monkeypatch):
                         lambda profile_name=None, **kw: profiles.append(profile_name) or real_session(**kw))
     assert main(["cp", f"s3://{BUCKET_A}/k", f"s3://{BUCKET_B}/k", "--src-profile", "only", "-q"]) == 0
     assert profiles == ["only"]
+
+
+# ---------------- architecture: layering and composition --------------------------
+
+import ast  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from s3xfer import (Copier, NullEvents, RetryPolicy, S3Path, Syncer,  # noqa: E402
+                    TransferConfig)
+
+PKG = Path(__file__).resolve().parents[1] / "src" / "s3xfer"
+
+# Each module may only import the ones listed (lower layers). Anything else,
+# including an import cycle, fails this test.
+ALLOWED = {
+    "paths": set(),
+    "plan": set(),
+    "retry": set(),
+    "events": {"paths", "plan"},
+    "progress": {"paths"},
+    "stream": {"plan"},
+    "copy": {"events", "paths", "plan", "retry"},
+    "sync": {"copy", "events", "paths", "plan", "retry"},
+    "cli": {"copy", "paths", "plan", "progress", "sync"},
+    "__main__": {"cli"},
+}
+
+
+def _internal_imports(module: str) -> set[str]:
+    tree = ast.parse((PKG / f"{module}.py").read_text())
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level == 1:
+            found.add(node.module)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for inner in ast.walk(node):
+                assert not isinstance(inner, (ast.Import, ast.ImportFrom)), \
+                    f"{module}.{node.name} imports inside a function"
+    return found
+
+
+def test_every_module_is_covered_by_the_layering_rules():
+    modules = {p.stem for p in PKG.glob("*.py")} - {"__init__"}
+    assert modules == set(ALLOWED)
+
+
+@pytest.mark.parametrize("module", sorted(ALLOWED))
+def test_module_imports_only_lower_layers(module):
+    assert _internal_imports(module) <= ALLOWED[module]
+
+
+def test_import_graph_has_no_cycles():
+    graph = {m: _internal_imports(m) for m in ALLOWED}
+    done, visiting = set(), set()
+
+    def visit(m, path):
+        assert m not in visiting, f"import cycle: {' -> '.join(path + [m])}"
+        if m in done:
+            return
+        visiting.add(m)
+        for dep in graph[m]:
+            visit(dep, path + [m])
+        visiting.discard(m)
+        done.add(m)
+
+    for m in graph:
+        visit(m, [])
+
+
+class RecordingEvents(NullEvents):
+    def __init__(self):
+        self.calls, self.bytes = [], 0
+
+    def start(self, items, skipped):
+        self.calls.append(("start", len(items), len(skipped)))
+
+    def file_started(self, index, item):
+        self.calls.append(("file", index, item.src_key))
+
+    def advance(self, nbytes):
+        self.bytes += nbytes
+
+    def warning(self, message):
+        self.calls.append(("warning", message.split(" (")[0]))
+
+    def finished(self):
+        self.calls.append(("finished",))
+
+
+def test_copier_reports_one_run_to_its_events(s3):
+    put(s3, "obj", os.urandom(40 * MiB))
+    ev = RecordingEvents()
+    res = Copier(s3, events=ev, config=TransferConfig("64MiB", 2)).copy(
+        S3Path(BUCKET_A, "obj"), S3Path(BUCKET_B, "obj"))
+    assert ev.calls == [("start", 1, 0), ("file", 0, "obj"), ("finished",)]
+    assert ev.bytes == 40 * MiB
+    assert (res.plan.chunk_size, res.plan.concurrency, res.parts_uploaded) == (16 * MiB, 2, 3)
+
+
+def test_copier_reports_finished_even_when_the_copy_fails(s3):
+    put(s3, "obj", os.urandom(12 * MiB))
+    ev = RecordingEvents()
+
+    def boom(**kw):
+        raise RuntimeError("upload failed")
+
+    s3.upload_part = boom
+    with pytest.raises(RuntimeError):
+        Copier(s3, events=ev, retry=RetryPolicy(1)).copy(S3Path(BUCKET_A, "obj"), S3Path(BUCKET_B, "obj"))
+    assert ev.calls[-1] == ("finished",)
+
+
+def test_copier_sends_large_chunk_warning_to_events_not_python_warnings(s3, recwarn):
+    put(s3, "big", os.urandom(40 * MiB))
+    ev = RecordingEvents()
+    Copier(s3, events=ev, config=TransferConfig("80MiB", 2, "1GiB")).copy(
+        S3Path(BUCKET_A, "big"), S3Path(BUCKET_B, "big"))
+    assert ("warning", "using 20 MiB chunks") in ev.calls
+    assert not recwarn.list
+
+
+def test_syncer_reports_one_run_for_many_files(s3):
+    put(s3, "p/a", b"a")
+    put(s3, "p/b", b"bb")
+    ev = RecordingEvents()
+    res = Syncer(Copier(s3, events=ev)).sync(S3Path(BUCKET_A, "p"), S3Path(BUCKET_B, "q"))
+    assert ev.calls == [("start", 2, 0), ("file", 0, "p/a"), ("file", 1, "p/b"), ("finished",)]
+    assert [i.dst for i in res.copied] == [S3Path(BUCKET_B, "q/a"), S3Path(BUCKET_B, "q/b")]
+
+
+def test_retry_policy_is_injected(s3):
+    put(s3, "obj", b"x" * 100)
+    calls = []
+    real = s3.get_object
+
+    def flaky(**kw):
+        calls.append(1)
+        if len(calls) < 4:
+            raise RuntimeError("transient")
+        return real(**kw)
+
+    s3.get_object = flaky
+    res = Copier(s3, retry=RetryPolicy(max_attempts=4, backoff=0)).copy(
+        S3Path(BUCKET_A, "obj"), S3Path(BUCKET_B, "obj"))
+    assert res.retries == 3
+    with pytest.raises(ValueError):
+        RetryPolicy(max_attempts=0)
+
+
+def test_s3path_parse():
+    assert S3Path.parse("s3://b/k/x") == S3Path("b", "k/x")
+    assert S3Path.parse("s3://b", allow_empty_key=True) == S3Path("b", "")
+    for bad in ("s3://b", "http://b/k", "b/k"):
+        with pytest.raises(ValueError):
+            S3Path.parse(bad)

@@ -1,6 +1,6 @@
-"""A dependency-free progress bar for the CLI.
+"""Terminal reporting for the CLI: a progress bar and a TransferEvents for it.
 
-On a terminal it redraws one line in place. When output is redirected
+On a terminal the bar redraws one line in place. When output is redirected
 (CI logs, files) it prints a plain line per file instead, so logs stay
 readable.
 """
@@ -11,6 +11,9 @@ import shutil
 import sys
 import threading
 import time
+from collections.abc import Sequence
+
+from .paths import TransferItem
 
 
 def human(n: float) -> str:
@@ -81,3 +84,49 @@ class ProgressBar:
         label = self.label if len(self.label) <= room else "…" + self.label[-(room - 1):] if room > 1 else ""
         self.stream.write("\r" + (line + label)[: width - 1].ljust(width - 1))
         self.stream.flush()
+
+
+class TerminalEvents:
+    """TransferEvents that drives a ProgressBar on stderr.
+
+    `summary=True` also prints "N to copy (size), M already up to date" when
+    the run starts (used by `sync`). Each distinct warning is printed once,
+    even with `enabled=False`, so -q never hides a warning.
+    """
+
+    def __init__(self, *, enabled: bool = True, summary: bool = False, stream=None):
+        self.enabled = enabled
+        self.summary = summary
+        self.stream = stream or sys.stderr
+        self.bar: ProgressBar | None = None
+        self._warned: set[str] = set()
+        self._lock = threading.Lock()
+
+    def start(self, items: Sequence[TransferItem], skipped: Sequence[TransferItem]) -> None:
+        total = sum(i.size for i in items)
+        if self.summary and self.enabled:
+            print(f"{len(items)} to copy ({human(total)}), {len(skipped)} already up to date",
+                  file=self.stream, flush=True)
+        self.bar = ProgressBar(total, len(items), stream=self.stream,
+                               enabled=self.enabled and bool(items))
+
+    def file_started(self, index: int, item: TransferItem) -> None:
+        if self.bar:
+            self.bar.start_file(index, item.src_key, item.size)
+
+    def advance(self, nbytes: int) -> None:
+        if self.bar:
+            self.bar.update(nbytes)
+
+    def warning(self, message: str) -> None:
+        with self._lock:
+            if message in self._warned:
+                return
+            self._warned.add(message)
+        # On a terminal the bar line is mid-draw; start the warning on a fresh line.
+        prefix = "\n" if self.bar and self.bar.tty else ""
+        print(f"{prefix}warning: {message}", file=self.stream, flush=True)
+
+    def finished(self) -> None:
+        if self.bar:
+            self.bar.close()

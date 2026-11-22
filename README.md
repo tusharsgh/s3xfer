@@ -8,12 +8,20 @@ A naive S3 copy reads the whole object into memory, so a 10 GB file needs 10+ GB
 
 ## What's inside
 
+s3xfer is built by composition: each concern is one small object, and you hand a `Copier` the pieces it should use.
+
 | Piece | What it does |
 | --- | --- |
+| `Copier(source, dest, config=, retry=, events=)` | S3 → S3 copy with parallel range GETs and multipart upload. Reads go through `source`, writes through `dest` (different clients = different credentials). Parts finish in any order, and `CompleteMultipartUpload` joins them by part number. A failure aborts the upload, so nothing is left half-done. |
+| `Syncer(copier, force=)` | Copies every object under a prefix, one object at a time with the copier's settings, so the memory budget covers the whole sync. Skips objects the destination already has with the same size and a newer-or-equal `LastModified`, like `aws s3 sync`. |
+| `TransferConfig(memory_budget, concurrency, max_chunk)` | The memory budget and parallelism; turns a file size into a chunk size and stream count that respect S3's limits (see the rule below). |
+| `RetryPolicy(max_attempts, backoff)` | Per-call retries with exponential backoff. |
+| `TransferEvents` | What a run reports: `start`, `file_started`, `advance(nbytes)`, `warning`, `finished`. Implement it for your own logging or metrics; `NullEvents` (the default) reports nothing, and the CLI's `TerminalEvents` draws the progress bar. |
+| `S3Path`, `TransferItem` | Plain data: a bucket + key, and one object to move. |
 | `S3RangeStream` | A seekable, read-only file object over S3. `seek()` moves a cursor, and `read()` issues a Range GET with a small read-ahead buffer. Pass it to `zipfile`, `openpyxl`, `csv` or `pandas` and only the bytes they ask for are downloaded. |
-| `s3_copy()` | S3 → S3 copy with parallel range GETs and multipart upload. Parts finish in any order, and `CompleteMultipartUpload` joins them by part number. Retries happen per part, and a failure aborts the upload, so nothing is left half-done. |
-| `s3_sync()` | Copies every object under a prefix to another prefix, one object at a time, so the memory budget covers the whole sync. Skips objects the destination already has with the same size and a newer-or-equal `LastModified`, like `aws s3 sync`. |
-| `plan_transfer()` | Turns a file size and a memory budget into a chunk size and a concurrency that respect S3's limits (5 MiB minimum part, 10,000 parts). |
+| `s3_copy()`, `s3_sync()` | Function shortcuts that build a `Copier` / `Syncer` for you. |
+
+Modules are layered (`paths`, `plan`, `retry` → `events`, `progress` → `copy` → `sync` → `cli`), and a test fails on any import that points upward or forms a cycle.
 
 ## The rule
 
@@ -40,39 +48,59 @@ Chunks only go above 16 MiB when S3's 10,000-part limit forces it (files over ~1
 ## Usage
 
 ```python
-import boto3, zipfile
-from s3xfer import S3RangeStream, s3_copy
+import boto3
+from s3xfer import Copier, RetryPolicy, S3Path, Syncer, TransferConfig
 
-s3 = boto3.client("s3")
+src = boto3.Session(profile_name="account-a").client("s3")
+dst = boto3.Session(profile_name="account-b").client("s3")
 
-# Copy a 50 GB object using at most ~256 MiB of RAM
-result = s3_copy(s3, "src-bucket", "big.parquet", "dst-bucket", "big.parquet",
-                 memory_budget="256MB", concurrency=8)
-print(result.plan)   # TransferPlan(file_size=..., chunk_size=16777216, concurrency=8, num_parts=...)
+copier = Copier(src, dst,
+                config=TransferConfig(memory_budget="512MiB", concurrency=16),
+                retry=RetryPolicy(max_attempts=5))
 
-# Read a zip's index from the end of a huge archive without downloading it
-with zipfile.ZipFile(S3RangeStream(s3, "bucket", "archive.zip")) as z:
+# Copy a 50 GB object using at most ~512 MiB for data in flight
+result = copier.copy(S3Path("src-bucket", "big.parquet"), S3Path("dst-bucket", "big.parquet"))
+print(result.plan)   # TransferPlan(file_size=..., chunk_size=16777216, concurrency=16, num_parts=...)
+
+# Copy a whole prefix with the same clients and settings
+Syncer(copier).sync(S3Path("src-bucket", "data/2024"), S3Path("dst-bucket", "backup/2024"))
+```
+
+Report progress anywhere by passing an object with the `TransferEvents` methods:
+
+```python
+from s3xfer import NullEvents
+
+class LogEvents(NullEvents):            # override only what you need
+    def file_started(self, index, item):
+        log.info("copying %s (%d bytes)", item.src, item.size)
+    def advance(self, nbytes):          # called from worker threads
+        metrics.increment("s3xfer.bytes", nbytes)
+
+Copier(src, dst, events=LogEvents()).copy(...)
+```
+
+Read a zip's index from the end of a huge archive without downloading it:
+
+```python
+import zipfile
+from s3xfer import S3RangeStream
+
+with zipfile.ZipFile(S3RangeStream(src, "bucket", "archive.zip")) as z:
     print(z.namelist())
 ```
 
-Different credentials for source and destination (for example, cross-account):
+The function shortcuts do the same in one call:
 
 ```python
-s3_copy(src_client, "a", "k", "b", "k", dst_client=dst_client, memory_budget="512MB")
+from s3xfer import s3_copy, s3_sync
+
+s3_copy(src, "src-bucket", "big.parquet", "dst-bucket", "big.parquet",
+        dst_client=dst, memory_budget="512MiB", concurrency=16)
+s3_sync(src, "src-bucket", "data/2024", "dst-bucket", "backup/2024",
+        on_plan=lambda todo, skipped: print(len(todo), "to copy"),
+        progress=lambda nbytes: ...)   # called as each part finishes (from worker threads)
 ```
-
-Copy a whole prefix, with progress callbacks:
-
-```python
-from s3xfer import s3_sync
-
-res = s3_sync(s3, "src-bucket", "data/2024", "dst-bucket", "backup/2024",
-              memory_budget="512MiB",
-              on_plan=lambda todo, skipped: print(len(todo), "to copy"),
-              progress=lambda nbytes: ...)   # called as each part finishes (from worker threads)
-```
-
-`s3_copy()` takes the same `progress` callback.
 
 CLI:
 
@@ -110,7 +138,7 @@ Measured on an `m7i-flex.large` in `ap-southeast-2`, copying within one bucket; 
 
 ```bash
 pip install -e ".[dev]"
-pytest                          # 58 tests against moto (fake S3, no AWS account needed)
+pytest                          # 76 tests against moto (fake S3, no AWS account needed)
 pip install -e ".[bench]"
 python bench/bench_memory.py    # memory benchmark → bench/results.csv
 python bench/plot.py            # redraw bench/memory_vs_filesize.png

@@ -51,6 +51,7 @@ class TransferPlan:
     chunk_size: int
     concurrency: int
     num_parts: int
+    warning: str | None = None  # set when max_chunk let chunks grow past 16 MiB
 
     @property
     def peak_memory(self) -> int:
@@ -68,6 +69,19 @@ class LargeChunkWarning(UserWarning):
 
 def plan_transfer(file_size: int, memory_budget: int | str, concurrency: int = 8,
                   max_chunk: int | str = PREFERRED_CHUNK) -> TransferPlan:
+    """Plan a transfer, issuing a LargeChunkWarning if plan.warning is set.
+
+    See `make_plan` for the rule. Library code that reports warnings its own
+    way (Copier, via TransferEvents) calls `make_plan` instead.
+    """
+    plan = make_plan(file_size, memory_budget, concurrency, max_chunk)
+    if plan.warning:
+        warnings.warn(plan.warning, LargeChunkWarning, stacklevel=2)
+    return plan
+
+
+def make_plan(file_size: int, memory_budget: int | str, concurrency: int = 8,
+              max_chunk: int | str = PREFERRED_CHUNK) -> TransferPlan:
     """Pick a chunk size and concurrency that respect the memory budget.
 
     The budget is shared between the streams: asking for more concurrency
@@ -80,8 +94,8 @@ def plan_transfer(file_size: int, memory_budget: int | str, concurrency: int = 8
     By default chunks never grow past PREFERRED_CHUNK (16 MiB) just because
     the budget is big: huge parts don't speed anything up and make every
     retry expensive. Pass a larger `max_chunk` (up to 5 GiB) to let chunks
-    grow to fill the budget anyway; a LargeChunkWarning is issued when that
-    actually produces chunks over 16 MiB. (S3's 10,000-part limit on very
+    grow to fill the budget anyway; plan.warning explains the trade-off when
+    that actually produces chunks over 16 MiB. (S3's 10,000-part limit on very
     large files can also force bigger chunks; that never warns.)
     Concurrency is reduced only when even the smallest allowed chunk
     doesn't fit `concurrency` times in the budget.
@@ -120,13 +134,24 @@ def plan_transfer(file_size: int, memory_budget: int | str, concurrency: int = 8
 
     num_parts = max(1, math.ceil(file_size / chunk))
     streams = min(streams, num_parts)
+    warning = None
     if chunk > max(PREFERRED_CHUNK, min_chunk) and num_parts > 1:
-        warnings.warn(
-            f"using {chunk // MiB} MiB chunks (max_chunk raised above "
-            f"{PREFERRED_CHUNK // MiB} MiB). Bigger chunks rarely add speed, and each "
-            f"failed part retries {chunk // MiB} MiB instead of {PREFERRED_CHUNK // MiB} MiB.",
-            LargeChunkWarning, stacklevel=2)
-    return TransferPlan(file_size, chunk, streams, num_parts)
+        warning = (f"using {chunk // MiB} MiB chunks (max_chunk raised above "
+                   f"{PREFERRED_CHUNK // MiB} MiB). Bigger chunks rarely add speed, and each "
+                   f"failed part retries {chunk // MiB} MiB instead of {PREFERRED_CHUNK // MiB} MiB.")
+    return TransferPlan(file_size, chunk, streams, num_parts, warning)
+
+
+@dataclass(frozen=True)
+class TransferConfig:
+    """How much memory and parallelism a transfer may use."""
+
+    memory_budget: int | str = "256MiB"
+    concurrency: int = 8
+    max_chunk: int | str = PREFERRED_CHUNK
+
+    def plan(self, file_size: int) -> TransferPlan:
+        return make_plan(file_size, self.memory_budget, self.concurrency, self.max_chunk)
 
 
 def _round_up(n: int, step: int) -> int:

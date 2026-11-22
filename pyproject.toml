@@ -16,7 +16,7 @@ dev = ["pytest", "moto[s3]>=5", "openpyxl"]
 bench = ["moto[server]>=5", "matplotlib"]
 
 [project.scripts]
-s3xfer = "s3xfer.__main__:main"
+s3xfer = "s3xfer.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/s3xfer"]
