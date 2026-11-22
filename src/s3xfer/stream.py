@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import io
 
+from .access import SourceReader
+from .paths import S3Path
 from .plan import MiB
 
 
@@ -23,10 +25,11 @@ class S3RangeStream(io.RawIOBase):
 
     def __init__(self, client, bucket: str, key: str, *, readahead: int = 1 * MiB):
         super().__init__()
-        self._client = client
+        self.__reader = SourceReader(client)  # read-only, client kept private
+        self.__path = S3Path(bucket, key)
         self.bucket = bucket
         self.key = key
-        self.size = client.head_object(Bucket=bucket, Key=key)["ContentLength"]
+        self.size = self.__reader.size(self.__path)
         self._pos = 0
         self._readahead = max(1, readahead)
         self._buf = b""
@@ -82,10 +85,15 @@ class S3RangeStream(io.RawIOBase):
     def readall(self) -> bytes:
         return self.read(-1)
 
+    def __repr__(self) -> str:
+        return f"S3RangeStream(s3://{self.bucket}/{self.key}, size={self.size})"
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("S3RangeStream holds credentials and can't be pickled or copied")
+
     # --- internals --------------------------------------------------------
     def _fill(self, start: int, length: int) -> None:
         end = min(start + length, self.size) - 1
-        resp = self._client.get_object(Bucket=self.bucket, Key=self.key, Range=f"bytes={start}-{end}")
+        self._buf = self.__reader.read(self.__path, start, end)
         self.requests += 1
-        self._buf = resp["Body"].read()
         self._buf_start = start

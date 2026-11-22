@@ -34,22 +34,25 @@ def _as_dir(prefix: str) -> str:
     return prefix if not prefix or prefix.endswith("/") else prefix + "/"
 
 
-def _list(client, bucket: str, prefix: str):
-    for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
-        yield from page.get("Contents", [])
-
-
 class Syncer:
     """Copies a prefix to another prefix, skipping objects that are up to date.
 
-    It is composed from a Copier and uses that copier's clients (the source
-    client lists the source, the dest client lists the destination), its
-    config and retry policy for every object, and its events for reporting.
+    It is composed from a Copier and never sees a client: it lists through the
+    copier's scoped source reader and destination writer, copies every object
+    with the copier's config and retry policy, and reports to its events.
     """
 
+    __slots__ = ("_copier", "_force")
+
     def __init__(self, copier: Copier, *, force: bool = False):
-        self.copier = copier
-        self.force = force
+        self._copier = copier
+        self._force = force
+
+    def __repr__(self) -> str:
+        return f"Syncer({self._copier!r}, force={self._force})"
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("Syncer holds credentials and can't be pickled or copied")
 
     def plan(self, src: S3Path, dst: S3Path) -> tuple[list[TransferItem], list[TransferItem]]:
         """Work out which objects need copying. Returns (to_copy, skipped).
@@ -62,11 +65,11 @@ class Syncer:
         dst = S3Path(dst.bucket, _as_dir(dst.key))
 
         existing = {}
-        if not self.force:
-            existing = {o["Key"]: o for o in _list(self.copier.dest, dst.bucket, dst.key)}
+        if not self._force:
+            existing = {o["Key"]: o for o in self._copier._list_dest(dst)}
 
         to_copy, skipped = [], []
-        for obj in _list(self.copier.source, src.bucket, src.key):
+        for obj in self._copier._list_source(src):
             key = obj["Key"]
             if key.endswith("/"):  # "folder" placeholder objects
                 continue
@@ -80,14 +83,14 @@ class Syncer:
 
     def sync(self, src: S3Path, dst: S3Path) -> SyncResult:
         started = time.monotonic()
-        events = self.copier.events
+        events = self._copier.events
         to_copy, skipped = self.plan(src, dst)
         events.start(to_copy, skipped)
         result = SyncResult(skipped=skipped)
         try:
             for i, item in enumerate(to_copy):
                 events.file_started(i, item)
-                r = self.copier.copy_item(item)
+                r = self._copier._copy_item(item)
                 result.copied.append(item)
                 result.bytes_copied += item.size
                 result.retries += r.retries

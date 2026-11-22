@@ -376,13 +376,14 @@ PKG = Path(__file__).resolve().parents[1] / "src" / "s3xfer"
 # Each module may only import the ones listed (lower layers). Anything else,
 # including an import cycle, fails this test.
 ALLOWED = {
+    "access": {"paths"},
     "paths": set(),
     "plan": set(),
     "retry": set(),
     "events": {"paths", "plan"},
     "progress": {"paths"},
-    "stream": {"plan"},
-    "copy": {"events", "paths", "plan", "retry"},
+    "stream": {"access", "paths", "plan"},
+    "copy": {"access", "events", "paths", "plan", "retry"},
     "sync": {"copy", "events", "paths", "plan", "retry"},
     "cli": {"copy", "paths", "plan", "progress", "sync"},
     "__main__": {"cli"},
@@ -516,3 +517,92 @@ def test_s3path_parse():
     for bad in ("s3://b", "http://b/k", "b/k"):
         with pytest.raises(ValueError):
             S3Path.parse(bad)
+
+
+# ---------------- credentials: private and least-privilege -------------------------
+
+import copy as copy_module  # noqa: E402
+import pickle  # noqa: E402
+
+from s3xfer.access import DestWriter, SourceReader  # noqa: E402
+
+READ_OPS = {"head_object", "get_object", "get_paginator"}
+WRITE_OPS = {"put_object", "create_multipart_upload", "upload_part",
+             "complete_multipart_upload", "abort_multipart_upload", "get_paginator"}
+
+
+class OnlyOps:
+    """A client proxy that fails the test on any S3 call outside `allowed`."""
+
+    def __init__(self, client, allowed, side):
+        self._client, self._allowed, self._side, self.used = client, allowed, side, set()
+
+    def __getattr__(self, name):
+        if name not in self._allowed:
+            raise AssertionError(f"{self._side} client used for {name}")
+        self.used.add(name)
+        return getattr(self._client, name)
+
+
+@pytest.mark.parametrize("size", [100, 40 * MiB])  # single PUT and multipart
+def test_copy_reads_only_with_source_and_writes_only_with_dest(s3, size):
+    put(s3, "obj", os.urandom(size))
+    src, dst = OnlyOps(s3, READ_OPS, "source"), OnlyOps(s3, WRITE_OPS, "dest")
+    Copier(src, dst, config=TransferConfig("64MiB", 2)).copy(S3Path(BUCKET_A, "obj"), S3Path(BUCKET_B, "obj"))
+    assert src.used <= {"head_object", "get_object"}
+    assert "get_object" not in dst.used and "head_object" not in dst.used
+
+
+def test_sync_reads_only_with_source_and_writes_only_with_dest(s3):
+    put(s3, "p/a", b"a")
+    put(s3, "p/big", os.urandom(12 * MiB))
+    src, dst = OnlyOps(s3, READ_OPS, "source"), OnlyOps(s3, WRITE_OPS, "dest")
+    res = Syncer(Copier(src, dst)).sync(S3Path(BUCKET_A, "p"), S3Path(BUCKET_B, "q"))
+    assert len(res.copied) == 2
+
+
+def test_failed_copy_aborts_with_dest_only(s3):
+    put(s3, "obj", os.urandom(12 * MiB))
+    src, dst = OnlyOps(s3, READ_OPS, "source"), OnlyOps(s3, WRITE_OPS, "dest")
+    s3.upload_part = lambda **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+    with pytest.raises(RuntimeError):
+        Copier(src, dst, retry=RetryPolicy(1)).copy(S3Path(BUCKET_A, "obj"), S3Path(BUCKET_B, "obj"))
+    assert "abort_multipart_upload" in dst.used
+
+
+def test_wrappers_expose_only_their_side():
+    assert not hasattr(SourceReader, "put") and not hasattr(SourceReader, "upload_part")
+    assert not hasattr(DestWriter, "read") and not hasattr(DestWriter, "size")
+
+
+class Secret:
+    def __repr__(self):
+        return "Secret(AKIAEXAMPLE)"
+
+
+@pytest.mark.parametrize("make", [
+    lambda c: SourceReader(c),
+    lambda c: DestWriter(c),
+    lambda c: Copier(c),
+    lambda c: Syncer(Copier(c)),
+])
+def test_nothing_exposes_the_client(make):
+    obj = make(Secret())
+    assert "AKIA" not in repr(obj) and "Secret" not in repr(obj)
+    public = [a for a in dir(obj) if not a.startswith("_")]
+    for name in public:
+        value = getattr(obj, name, None)
+        assert not isinstance(value, Secret), f"{type(obj).__name__}.{name} returns the client"
+    assert not hasattr(obj, "__dict__"), "slots only: no ad-hoc attributes"
+    for leak in (pickle.dumps, copy_module.copy, copy_module.deepcopy):
+        with pytest.raises(TypeError):
+            leak(obj)
+
+
+def test_range_stream_keeps_client_private(s3):
+    put(s3, "f", b"0123456789")
+    st = S3RangeStream(s3, BUCKET_A, "f")
+    assert st.read(4) == b"0123"
+    assert "client" not in " ".join(a for a in dir(st) if not a.startswith("_"))
+    with pytest.raises(TypeError):
+        pickle.dumps(st)

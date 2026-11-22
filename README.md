@@ -17,11 +17,12 @@ s3xfer is built by composition: each concern is one small object, and you hand a
 | `TransferConfig(memory_budget, concurrency, max_chunk)` | The memory budget and parallelism; turns a file size into a chunk size and stream count that respect S3's limits (see the rule below). |
 | `RetryPolicy(max_attempts, backoff)` | Per-call retries with exponential backoff. |
 | `TransferEvents` | What a run reports: `start`, `file_started`, `advance(nbytes)`, `warning`, `finished`. Implement it for your own logging or metrics; `NullEvents` (the default) reports nothing, and the CLI's `TerminalEvents` draws the progress bar. |
+| `SourceReader`, `DestWriter` | The only code that touches a boto3 client. The source side can only head, get and list; the destination side can only put, run a multipart upload and list. See [Credentials and access](#credentials-and-access). |
 | `S3Path`, `TransferItem` | Plain data: a bucket + key, and one object to move. |
 | `S3RangeStream` | A seekable, read-only file object over S3. `seek()` moves a cursor, and `read()` issues a Range GET with a small read-ahead buffer. Pass it to `zipfile`, `openpyxl`, `csv` or `pandas` and only the bytes they ask for are downloaded. |
 | `s3_copy()`, `s3_sync()` | Function shortcuts that build a `Copier` / `Syncer` for you. |
 
-Modules are layered (`paths`, `plan`, `retry` → `events`, `progress` → `copy` → `sync` → `cli`), and a test fails on any import that points upward or forms a cycle.
+Modules are layered (`paths`, `plan`, `retry` → `access`, `events`, `progress`, `stream` → `copy` → `sync` → `cli`), and a test fails on any import that points upward or forms a cycle.
 
 ## The rule
 
@@ -118,6 +119,40 @@ A prefix is treated as a folder: `s3://b/data` matches `data/...` but not `data2
 
 Without `--dst-profile`, the destination uses the same credentials as the source. Without `--src-profile`, the source uses boto3's default credential chain.
 
+## Credentials and access
+
+**s3xfer never sees your credentials.** It takes boto3 clients (or, on the CLI, `--src-profile` / `--dst-profile` names) and boto3 resolves the credentials from your profiles, SSO, `aws login` or an instance role. There are no flags or arguments for access keys, so keys never end up in shell history, process listings or code.
+
+**Clients stay private and scoped inside s3xfer.**
+- Each client is wrapped as soon as it's passed in: the source client in a `SourceReader` (head, get, list) and the destination client in a `DestWriter` (put, multipart upload, list). Code holding the source can't write; code holding the destination can't read objects. Tests run every copy and sync through clients that fail on any other call.
+- `Copier`, `Syncer`, `S3RangeStream` and the wrappers keep the client in private slots, have no attribute that returns it, show `<client hidden>` in their repr (so it doesn't end up in logs), and refuse to be pickled or copied.
+- This prevents accidental exposure and misuse, but Python can't hide an object from other code in the same process. The real limit is what the credentials themselves are allowed to do:
+
+**Give each side only the permissions it needs.** Source (read-only):
+
+```json
+{"Version": "2012-10-17", "Statement": [
+  {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::SRC-BUCKET/PREFIX/*"},
+  {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::SRC-BUCKET",
+   "Condition": {"StringLike": {"s3:prefix": "PREFIX/*"}}}
+]}
+```
+
+Destination (write-only; `ListBucket` is only needed for `sync`'s skip check):
+
+```json
+{"Version": "2012-10-17", "Statement": [
+  {"Effect": "Allow", "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
+   "Resource": "arn:aws:s3:::DST-BUCKET/PREFIX/*"},
+  {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::DST-BUCKET",
+   "Condition": {"StringLike": {"s3:prefix": "PREFIX/*"}}}
+]}
+```
+
+These exact policies were tested on real S3 with two separate roles: the copy and sync worked with reader → writer, and failed with `AccessDenied` when the profiles were swapped. If the buckets use SSE-KMS, also allow `kms:Decrypt` on the source key and `kms:GenerateDataKey` on the destination key.
+
+Prefer short-lived credentials: an IAM role on EC2/ECS/Lambda, SSO, or `aws login` on a laptop, rather than long-lived access keys.
+
 ## Real-S3 benchmarks
 
 Measured on an `m7i-flex.large` in `ap-southeast-2`, copying within one bucket; median of 3 runs. Reproduce with `bench/bench_real_s3.py` (see its docstring) and `bench/plot_real_s3.py`. Raw numbers: [`bench/real_s3_results.csv`](bench/real_s3_results.csv).
@@ -138,7 +173,7 @@ Measured on an `m7i-flex.large` in `ap-southeast-2`, copying within one bucket; 
 
 ```bash
 pip install -e ".[dev]"
-pytest                          # 76 tests against moto (fake S3, no AWS account needed)
+pytest                          # 87 tests against moto (fake S3, no AWS account needed)
 pip install -e ".[bench]"
 python bench/bench_memory.py    # memory benchmark → bench/results.csv
 python bench/plot.py            # redraw bench/memory_vs_filesize.png
