@@ -2,6 +2,10 @@
 
 Stream and copy S3 objects of **any size in constant memory**. Requires Python 3.10+.
 
+```bash
+pip install s3xfer
+```
+
 A naive S3 copy reads the whole object into memory, so a 10 GB file needs 10+ GB of RAM and a worker with a fixed memory limit gets OOM-killed. `s3xfer` keeps memory flat: you give it a budget, and file size only changes how many chunks it moves, never how much it holds at once.
 
 ![Peak memory vs file size](bench/memory_vs_filesize.png)
