@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]  # 1.27: PEP 639 license expressions
 build-backend = "hatchling.build"
 
 [project]
@@ -7,13 +7,13 @@ name = "s3xfer"
 version = "0.1.0"
 description = "Stream and copy S3 objects of any size in constant memory"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT"
-dependencies = ["boto3[crt]>=1.26"]  # crt: needed for `aws login` credentials
+dependencies = ["boto3[crt]>=1.42"]  # crt: needed for `aws login` credentials
 
 [project.optional-dependencies]
-dev = ["pytest", "moto[s3]>=5", "openpyxl"]
-bench = ["moto[server]>=5", "matplotlib"]
+dev = ["pytest>=8", "moto[s3]>=5.1", "openpyxl>=3.1"]
+bench = ["moto[server]>=5.1", "matplotlib>=3.9"]
 
 [project.scripts]
 s3xfer = "s3xfer.cli:main"
