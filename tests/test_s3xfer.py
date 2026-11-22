@@ -6,8 +6,8 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from s3flat import BudgetTooSmall, S3RangeStream, parse_size, plan_transfer, s3_copy
-from s3flat.plan import COPY_FACTOR, MAX_PARTS, MiB, GiB
+from s3xfer import BudgetTooSmall, S3RangeStream, parse_size, plan_transfer, s3_copy
+from s3xfer.plan import COPY_FACTOR, MAX_PARTS, MiB, GiB
 
 BUCKET_A, BUCKET_B = "src-bucket", "dst-bucket"
 
@@ -83,7 +83,7 @@ def test_big_budget_does_not_make_huge_chunks():
 
 
 def test_max_chunk_lets_chunks_fill_the_budget_with_warning():
-    from s3flat import LargeChunkWarning
+    from s3xfer import LargeChunkWarning
     with pytest.warns(LargeChunkWarning, match="128 MiB chunks"):
         p = plan_transfer(10 * GiB, "2GiB", 8, max_chunk="1GiB")
     assert (p.chunk_size, p.concurrency) == (128 * MiB, 8)
@@ -245,9 +245,9 @@ def test_in_flight_chunks_never_exceed_plan(s3):
 
 # ---------------- progress / sync / CLI ----------------------------------------
 
-from s3flat import plan_sync, s3_sync  # noqa: E402
-from s3flat.__main__ import main  # noqa: E402
-from s3flat.progress import ProgressBar  # noqa: E402
+from s3xfer import plan_sync, s3_sync  # noqa: E402
+from s3xfer.__main__ import main  # noqa: E402
+from s3xfer.progress import ProgressBar  # noqa: E402
 
 
 @pytest.mark.parametrize("size", [0, 100, 12 * MiB])

@@ -1,4 +1,4 @@
-"""Peak Python memory: naive copy vs s3flat, across file sizes.
+"""Peak Python memory: naive copy vs s3xfer, across file sizes.
 
 Runs against moto as a separate local server, so it measures only *this process's*
 allocations during the copy. Real-S3 runs belong in the blog too.
@@ -21,7 +21,7 @@ import subprocess
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from s3flat import s3_copy  # noqa: E402
+from s3xfer import s3_copy  # noqa: E402
 
 MiB = 1024 * 1024
 SIZES_MIB = [64, 128, 256, 512, 1024]
@@ -75,14 +75,14 @@ def main():
             flat = measure(lambda: s3_copy(c, "src", key, "dst", key + ".flat",
                                            memory_budget=BUDGET, concurrency=8))
             rows.append((mib, naive / MiB, flat / MiB))
-            print(f"{mib:>5} MiB file | naive peak {naive / MiB:8.1f} MiB | s3flat peak {flat / MiB:6.1f} MiB")
+            print(f"{mib:>5} MiB file | naive peak {naive / MiB:8.1f} MiB | s3xfer peak {flat / MiB:6.1f} MiB")
             c.delete_object(Bucket="src", Key=key)
     finally:
         server.terminate()
     out = Path(__file__).with_name("results.csv")
     with out.open("w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["file_mib", "naive_peak_mib", "s3flat_peak_mib"])
+        w.writerow(["file_mib", "naive_peak_mib", "s3xfer_peak_mib"])
         w.writerows((m, f"{n:.1f}", f"{s:.1f}") for m, n, s in rows)
     print(f"wrote {out}")
 

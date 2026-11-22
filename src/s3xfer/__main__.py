@@ -1,7 +1,7 @@
 """CLI.
 
-    s3flat cp   s3://src-bucket/key    s3://dst-bucket/key    --memory 512MiB
-    s3flat sync s3://src-bucket/prefix s3://dst-bucket/prefix --memory 512MiB
+    s3xfer cp   s3://src-bucket/key    s3://dst-bucket/key    --memory 512MiB
+    s3xfer sync s3://src-bucket/prefix s3://dst-bucket/prefix --memory 512MiB
 """
 
 from __future__ import annotations
@@ -101,7 +101,7 @@ def _cmd_sync(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="s3flat", description="Constant-memory S3 tools")
+    ap = argparse.ArgumentParser(prog="s3xfer", description="Constant-memory S3 tools")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     cp = sub.add_parser("cp", help="copy one object S3 -> S3")

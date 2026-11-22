@@ -1,4 +1,4 @@
-"""s3flat: stream and copy S3 objects of any size in constant memory."""
+"""s3xfer: stream and copy S3 objects of any size in constant memory."""
 
 from .copy import CopyResult, s3_copy
 from .plan import BudgetTooSmall, LargeChunkWarning, TransferPlan, parse_size, plan_transfer
